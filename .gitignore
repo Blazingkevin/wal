@@ -1,0 +1,25 @@
+# Compiled binaries and test output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Profiling and coverage output
+*.out
+*.prof
+cpu.out
+mem.out
+
+# Benchmark results (committed separately after a deliberate run)
+bench/results.txt
+
+# macOS noise
+.DS_Store
+
+# Editor directories
+.idea/
+.vscode/
+*.swp
+*.swo
