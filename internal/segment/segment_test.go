@@ -1,6 +1,8 @@
 package segment_test
 
 import (
+	"errors"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -283,5 +285,208 @@ func TestWriteEmpty(t *testing.T) {
 	wantSize := int64(16 + record.HeaderSize)
 	if s.Size() != wantSize {
 		t.Errorf("Size = %d, want %d", s.Size(), wantSize)
+	}
+}
+
+// Reader TYEsts
+func TestOpenReader(t *testing.T) {
+	dir := t.TempDir()
+	s, err := segment.Create(dir, 1, segment.DefaultMaxSize)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	payloads := [][]byte{
+		[]byte("alpha"),
+		[]byte("beta"),
+		[]byte("gamma"),
+	}
+	for _, p := range payloads {
+		if err := s.Write(p); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	s.Close()
+
+	r, err := segment.OpenReader(segment.Path(dir, 1))
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	defer r.Close()
+
+	for i, want := range payloads {
+		got, err := r.Next()
+		if err != nil {
+			t.Fatalf("Next() record %d: %v", i, err)
+		}
+		if string(got) != string(want) {
+			t.Errorf("record %d = %q, want %q", i, got, want)
+		}
+	}
+
+	_, err = r.Next()
+	if !errors.Is(err, io.EOF) {
+		t.Errorf("Next() after last record = %v, want io.EOF", err)
+	}
+}
+
+func TestReaderIndex(t *testing.T) {
+	dir := t.TempDir()
+	s, err := segment.Create(dir, 5, segment.DefaultMaxSize)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	s.Close()
+
+	r, err := segment.OpenReader(segment.Path(dir, 5))
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	defer r.Close()
+
+	if r.Index() != 5 {
+		t.Errorf("Index = %d, want 5", r.Index())
+	}
+}
+
+func makeSegment(t *testing.T, dir string, index uint64, payloads [][]byte) string {
+	t.Helper()
+	s, err := segment.Create(dir, index, segment.DefaultMaxSize)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	for _, p := range payloads {
+		if err := s.Write(p); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	if err := s.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	return segment.Path(dir, index)
+}
+
+func TestRecoverClean(t *testing.T) {
+	dir := t.TempDir()
+	payloads := [][]byte{[]byte("one"), []byte("two"), []byte("three")}
+	makeSegment(t, dir, 1, payloads)
+
+	info, _ := os.Stat(segment.Path(dir, 1))
+	sizeBeforeRecover := info.Size()
+
+	seg, err := segment.Recover(dir, 1, segment.DefaultMaxSize)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	defer seg.Close()
+
+	if seg.Size() != sizeBeforeRecover {
+		t.Errorf("size after clean recover = %d, want %d", seg.Size(), sizeBeforeRecover)
+	}
+
+	if err := seg.Write([]byte("after recovery")); err != nil {
+		t.Errorf("Write after recovery: %v", err)
+	}
+}
+
+func TestRecoverTornWriteMidPayload(t *testing.T) {
+	dir := t.TempDir()
+	payloads := [][]byte{[]byte("first"), []byte("second"), []byte("third")}
+	path := makeSegment(t, dir, 1, payloads)
+
+	cleanSize, _ := os.Stat(path)
+	wantSize := cleanSize.Size()
+
+	torn := []byte{
+		0x00, 0x00, 0x00, 0x14, // length = 20
+		0xDE, 0xAD, 0xBE, 0xEF, // checksum (garbage tha won't match)
+		0x01, 0x02, 0x03, 0x04, // only 4 of the 20 payload bytes present
+	}
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	f.Write(torn)
+	f.Close()
+
+	seg, err := segment.Recover(dir, 1, segment.DefaultMaxSize)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	defer seg.Close()
+
+	if seg.Size() != wantSize {
+		t.Errorf("size after recover = %d, want %d (clean boundary)", seg.Size(), wantSize)
+	}
+
+	info, _ := os.Stat(path)
+	if info.Size() != wantSize {
+		t.Errorf("disk size after recover = %d, want %d", info.Size(), wantSize)
+	}
+
+	r, err := segment.OpenReader(path)
+	if err != nil {
+		t.Fatalf("OpenReader after recover: %v", err)
+	}
+	defer r.Close()
+
+	for i, want := range payloads {
+		got, err := r.Next()
+		if err != nil {
+			t.Fatalf("Next() record %d after recover: %v", i, err)
+		}
+		if string(got) != string(want) {
+			t.Errorf("record %d after recover = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestRecoverTornWritePartialHeader(t *testing.T) {
+	dir := t.TempDir()
+	payloads := [][]byte{[]byte("alpha"), []byte("beta")}
+	path := makeSegment(t, dir, 1, payloads)
+
+	info, _ := os.Stat(path)
+	cleanSize := info.Size()
+
+	os.Truncate(path, cleanSize+2)
+
+	seg, err := segment.Recover(dir, 1, segment.DefaultMaxSize)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	defer seg.Close()
+
+	if seg.Size() != cleanSize {
+		t.Errorf("size after recover = %d, want %d", seg.Size(), cleanSize)
+	}
+}
+
+func TestRecoverInvalidMagic(t *testing.T) {
+	dir := t.TempDir()
+	path := segment.Path(dir, 1)
+
+	garbage := make([]byte, 32)
+	copy(garbage[0:4], "NOPE")
+	os.WriteFile(path, garbage, 0o600)
+
+	_, err := segment.Recover(dir, 1, segment.DefaultMaxSize)
+	if !errors.Is(err, segment.ErrInvalidSegment) {
+		t.Errorf("Recover with bad magic = %v, want ErrInvalidSegment", err)
+	}
+}
+
+func TestRecoverIndexMismatch(t *testing.T) {
+	dir := t.TempDir()
+
+	makeSegment(t, dir, 1, [][]byte{[]byte("data")})
+
+	src := segment.Path(dir, 1)
+	dst := segment.Path(dir, 2)
+	os.Rename(src, dst)
+
+	_, err := segment.Recover(dir, 2, segment.DefaultMaxSize)
+	if !errors.Is(err, segment.ErrIndexMismatch) {
+		t.Errorf("Recover with index mismatch = %v, want ErrIndexMismatch", err)
 	}
 }
