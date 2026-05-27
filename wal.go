@@ -178,6 +178,27 @@ func (w *WAL) LastIndex() uint64 {
 	return w.nextIndex - 1
 }
 
+func (w *WAL) Reader(startIndex uint64) (*Reader, error) {
+	w.mu.Lock()
+	indices := make([]uint64, len(w.segIndices))
+	copy(indices, w.segIndices)
+	endIndex := w.nextIndex
+	w.mu.Unlock()
+
+	paths := make([]string, len(indices))
+	for i, idx := range indices {
+		paths[i] = segment.Path(w.dir, idx)
+	}
+
+	return &Reader{
+		paths:      paths,
+		startIndex: startIndex,
+		endIndex:   endIndex,
+		curIndex:   0,
+		segPos:     0,
+	}, nil
+}
+
 func listSegments(dir string) ([]uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
