@@ -83,6 +83,68 @@ func (s *syncPeriodic) flush() {
 	}
 }
 
+func SyncBatch() SyncPolicy {
+	s := &syncBatch{}
+	s.cond = sync.NewCond(&s.mu)
+	return s
+}
+
+type syncBatch struct {
+	mu         sync.Mutex
+	cond       *sync.Cond
+	generation uint64
+	fsyncing   bool
+	lastErr    error
+	closed     bool
+}
+
+func (s *syncBatch) Sync(seg *segment.Segment) error {
+	s.mu.Lock()
+
+	if s.closed {
+		s.mu.Unlock()
+		return ErrClosed
+	}
+
+	gen := s.generation
+
+	if s.fsyncing {
+		for s.generation == gen && !s.closed {
+			s.cond.Wait()
+		}
+		if s.closed {
+			s.mu.Unlock()
+			return ErrClosed
+		}
+		err := s.lastErr
+		s.mu.Unlock()
+		return err
+	}
+
+	s.fsyncing = true
+	s.mu.Unlock()
+
+	err := seg.Sync()
+
+	s.mu.Lock()
+	s.generation++
+	s.fsyncing = false
+	s.lastErr = err
+	s.mu.Unlock()
+
+	s.cond.Broadcast()
+
+	return err
+}
+
+func (s *syncBatch) Close() error {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	s.cond.Broadcast()
+	return nil
+}
+
 func SyncNone() SyncPolicy { return &syncNone{} }
 
 type syncNone struct{}

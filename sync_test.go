@@ -3,6 +3,7 @@ package wal_test
 import (
 	"fmt"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -123,5 +124,99 @@ func TestSyncPeriodicNoGoroutineLeak(t *testing.T) {
 	if after > baseline+2 {
 		t.Errorf("goroutine count after %d open+close cycles: before=%d after=%d ... possible leak",
 			n, baseline, after)
+	}
+}
+
+func TestSyncBatchSingleWriterDurable(t *testing.T) {
+	dir := t.TempDir()
+	w, err := wal.Open(dir, wal.WithSyncPolicy(wal.SyncBatch()))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	if _, err := w.Write([]byte("single")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	w2 := openWAL(t, dir)
+	r, err := w2.Reader(0)
+	if err != nil {
+		t.Fatalf("Reader: %v", err)
+	}
+	defer r.Close()
+
+	data, err := r.Next()
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if string(data) != "single" {
+		t.Errorf("got %q, want %q", data, "single")
+	}
+}
+
+func TestSyncBatchConcurrentWritesDurable(t *testing.T) {
+	dir := t.TempDir()
+	w, err := wal.Open(dir, wal.WithSyncPolicy(wal.SyncBatch()))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	const n = 50
+	var wg sync.WaitGroup
+	errCh := make(chan error, n)
+
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			if _, err := w.Write([]byte(fmt.Sprintf("record-%d", i))); err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Errorf("Write error: %v", err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	w2 := openWAL(t, dir)
+	r, err := w2.Reader(0)
+	if err != nil {
+		t.Fatalf("Reader: %v", err)
+	}
+	defer r.Close()
+
+	count := 0
+	for {
+		if _, err := r.Next(); err != nil {
+			break
+		}
+		count++
+	}
+	if count != n {
+		t.Errorf("after reopen: got %d records, want %d", count, n)
+	}
+}
+
+func TestSyncBatchCloseIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	w, err := wal.Open(dir, wal.WithSyncPolicy(wal.SyncBatch()))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
 	}
 }
